@@ -1,7 +1,4 @@
-/* Penalti online server: Cloudflare Worker + Durable Object.
-   Har xona (lobby yoki pen-XXXX) — alohida Durable Object. O'yinchilar WebSocket orqali ulanadi,
-   har biri o'z "presence" holatini yuboradi, server hammaga ro'yxatni tarqatadi.
-   Lobby xonasi oxirgi 14 ta natijani ham saqlaydi. */
+/* Penalti online server: Cloudflare Worker + Durable Object + Telegram bot */
 import { DurableObject } from "cloudflare:workers";
 
 const MAX_PEERS = 40;
@@ -84,6 +81,25 @@ export class MyDurableObject extends DurableObject {
   }
 }
 
+const GAME_URL = "https://penalti-uz.pages.dev";
+
+async function telegram(req: Request, env: any): Promise<Response> {
+  const token = env.BOT_TOKEN || "";
+  if (!token || req.headers.get("X-Telegram-Bot-Api-Secret-Token") !== token.replace(":", "")) return new Response("no", { status: 403 });
+  let u: any;
+  try { u = await req.json(); } catch (e) { return new Response("ok"); }
+  const msg = u && u.message;
+  if (msg && msg.chat && msg.chat.type === "private") {
+    const name = (msg.from && msg.from.first_name) || "do'stim";
+    const text = "⚽ Salom, " + name + "!\n\nPENALTI SERIYASI — top-5 liganing 22 jamoasi.\n5+5 zarba, durang bo'lsa hal qiluvchi zarbalar.\n\n🎯 Kompyuterga qarshi\n👥 Bitta telefonda 2 kishi\n🌍 Online duel — do'stingga kod yuborasan\n\nPastdagi tugmani bos 👇";
+    await fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: msg.chat.id, text, reply_markup: { inline_keyboard: [[{ text: "⚽ O'ynash", web_app: { url: GAME_URL } }]] } }),
+    });
+  }
+  return new Response("ok");
+}
+
 export default {
   async fetch(req: Request, env: any): Promise<Response> {
     const url = new URL(req.url);
@@ -92,6 +108,7 @@ export default {
       const stub = env.MY_DURABLE_OBJECT.get(env.MY_DURABLE_OBJECT.idFromName(room));
       return stub.fetch(req);
     }
+    if (url.pathname === "/tg" && req.method === "POST") return telegram(req, env);
     return new Response("Penalti online server ishlayapti ✅", { headers: { "content-type": "text/plain; charset=utf-8" } });
   },
 };
