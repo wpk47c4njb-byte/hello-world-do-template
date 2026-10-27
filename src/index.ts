@@ -1,71 +1,97 @@
+/* Penalti online server: Cloudflare Worker + Durable Object.
+   Har xona (lobby yoki pen-XXXX) — alohida Durable Object. O'yinchilar WebSocket orqali ulanadi,
+   har biri o'z "presence" holatini yuboradi, server hammaga ro'yxatni tarqatadi.
+   Lobby xonasi oxirgi 14 ta natijani ham saqlaydi. */
 import { DurableObject } from "cloudflare:workers";
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+const MAX_PEERS = 40;
+const MAX_MSG = 6000;
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject<Env> {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 */
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
-	}
+export class MyDurableObject extends DurableObject {
+  mem: Map<string, any>;
+  constructor(ctx: any, env: any) {
+    super(ctx, env);
+    this.mem = new Map();
+  }
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(): Promise<string> {
-		let result = this.ctx.storage.sql
-			.exec("SELECT 'Hello, World!' as greeting")
-			.one() as { greeting: string };
-		return result.greeting;
-	}
+  async fetch(req: Request): Promise<Response> {
+    if (req.headers.get("Upgrade") !== "websocket") return new Response("WebSocket kerak", { status: 426 });
+    const url = new URL(req.url);
+    const peer = (url.searchParams.get("peer") || "").replace(/[^a-zA-Z0-9]/g, "").slice(0, 24) || "p" + Math.random().toString(36).slice(2, 10);
+    if (this.live().length >= MAX_PEERS) return new Response("Xona to'la", { status: 429 });
+    const pair = new WebSocketPair();
+    const client = pair[0], server = pair[1];
+    this.ctx.acceptWebSocket(server);
+    server.serializeAttachment({ peer, presence: {} });
+    const results = (await this.ctx.storage.get("results")) || [];
+    server.send(JSON.stringify({ t: "hello", peer, results }));
+    this.broadcastPeers();
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  live(): any[] {
+    return this.ctx.getWebSockets().filter((ws: any) => {
+      const a = ws.deserializeAttachment();
+      return a && !a.gone && ws.readyState === 1;
+    });
+  }
+
+  presenceOf(ws: any) {
+    const a = ws.deserializeAttachment() || {};
+    return this.mem.has(a.peer) ? this.mem.get(a.peer) : a.presence || {};
+  }
+
+  broadcastPeers() {
+    const list = this.live().map((ws: any) => ({ peer: ws.deserializeAttachment().peer, presence: this.presenceOf(ws) }));
+    const msg = JSON.stringify({ t: "peers", peers: list });
+    for (const ws of this.live()) { try { ws.send(msg); } catch (e) {} }
+  }
+
+  async webSocketMessage(ws: any, data: any) {
+    if (typeof data !== "string" || data.length > MAX_MSG) return;
+    let m: any;
+    try { m = JSON.parse(data); } catch (e) { return; }
+    if (!m || typeof m !== "object") return;
+    if (m.t === "presence" && m.p && typeof m.p === "object") {
+      const a = ws.deserializeAttachment() || {};
+      const s = JSON.stringify(m.p);
+      if (s.length < 1800) { a.presence = m.p; this.mem.delete(a.peer); }
+      else { a.presence = {}; this.mem.set(a.peer, m.p); }
+      ws.serializeAttachment(a);
+      this.broadcastPeers();
+    } else if (m.t === "result" && m.r && typeof m.r === "object" && JSON.stringify(m.r).length < 600) {
+      let list: any[] = (await this.ctx.storage.get("results")) || [];
+      list = [m.r].concat(list.filter((x: any) => x && x.at !== m.r.at)).slice(0, 14);
+      await this.ctx.storage.put("results", list);
+      const msg = JSON.stringify({ t: "results", results: list });
+      for (const s of this.live()) { try { s.send(msg); } catch (e) {} }
+    } else if (m.t === "ping") {
+      try { ws.send('{"t":"pong"}'); } catch (e) {}
+    }
+  }
+
+  async webSocketClose(ws: any) {
+    const a = ws.deserializeAttachment() || {};
+    a.gone = true;
+    try { ws.serializeAttachment(a); } catch (e) {}
+    this.mem.delete(a.peer);
+    try { ws.close(1000, "bye"); } catch (e) {}
+    this.broadcastPeers();
+  }
+
+  async webSocketError(ws: any) {
+    await this.webSocketClose(ws);
+  }
 }
 
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx): Promise<Response> {
-		// Create a `DurableObjectId` for an instance of the `MyDurableObject`
-		// class. The name of class is used to identify the Durable Object.
-		// Requests from all Workers to the instance named
-		// will go to a single globally unique Durable Object instance.
-		const id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(
-			new URL(request.url).pathname,
-		);
-
-		// Create a stub to open a communication channel with the Durable
-		// Object instance.
-		const stub = env.MY_DURABLE_OBJECT.get(id);
-
-		// Call the `sayHello()` RPC method on the stub to invoke the method on
-		// the remote Durable Object instance
-		const greeting = await stub.sayHello();
-
-		return new Response(greeting);
-	},
-} satisfies ExportedHandler<Env>;
+  async fetch(req: Request, env: any): Promise<Response> {
+    const url = new URL(req.url);
+    if (url.pathname === "/ws") {
+      const room = (url.searchParams.get("room") || "lobby").toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 40) || "lobby";
+      const stub = env.MY_DURABLE_OBJECT.get(env.MY_DURABLE_OBJECT.idFromName(room));
+      return stub.fetch(req);
+    }
+    return new Response("Penalti online server ishlayapti ✅", { headers: { "content-type": "text/plain; charset=utf-8" } });
+  },
+};
